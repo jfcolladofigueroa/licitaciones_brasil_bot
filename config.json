@@ -26,12 +26,5 @@
 ],
     "ufs": ["PR","SP","SC","RS","RJ","MG"],
     "dias_atras": 150
-  },
-  
-  "email": {
-    "provedor": "resend",
-    "api_key": "re_2N1TKp5J_P4hptdeRRK6coumeQ1cR2DBE",
-    "email_from": "onboarding@resend.dev",
-    "email_to": "jfcollado.figueroa@gmail.com"
   }
 }

@@ -1,0 +1,37 @@
+{
+  "database": "licitacoes.db",
+  
+  "busca": {
+    "termos": [
+  "Software",
+  "Desenvolvimento de Software",
+  "Sistemas de Informação",
+  "Serviços de Software",
+  "Fábrica de Software",
+  "Desenvolvimento de Sistemas",
+  "Manutenção Evolutiva de Software",
+  "Sustentação de Sistemas",
+  "Desenvolvimento de Aplicativos Móveis",
+  "Desenvolvimento de Apps",
+  "Criação de Portais Web",
+  "Serviços de TIC",
+  "Unidade de Serviço Técnico",
+  "Pontos de Função",
+  "Suporte e Manutenção de Software",
+  "Implementação de Soluções Tecnológicas",
+  "Locação de Software",
+  "Software como Serviço",
+  "Integração de Sistemas",
+  "Desenvolvimento de Software sob Medida"
+],
+    "ufs": ["PR","SP","SC","RS","RJ","MG"],
+    "dias_atras": 150
+  },
+  
+  "email": {
+    "provedor": "resend",
+    "api_key": "re_2N1TKp5J_P4hptdeRRK6coumeQ1cR2DBE",
+    "email_from": "onboarding@resend.dev",
+    "email_to": "jfcollado.figueroa@gmail.com"
+  }
+}

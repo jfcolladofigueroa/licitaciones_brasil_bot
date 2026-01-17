@@ -1,0 +1,2 @@
+# Monitor de Licitações Brasil - Dependências
+requests>=2.28.0

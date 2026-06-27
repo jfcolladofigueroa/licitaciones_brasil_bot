@@ -1,0 +1,17 @@
+# Configuración local con secretos (API keys, emails) — NO versionar
+config.json
+
+# Entorno virtual
+licitaciones_env/
+
+# Base de datos local e histórico
+*.db
+licitacoes.db
+
+# Logs
+*.log
+monitor.log
+
+# Python
+__pycache__/
+*.py[cod]

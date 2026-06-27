@@ -12,11 +12,21 @@ Parámetros de la API (endpoint /v1/contratacoes/publicacao):
 - tamanhoPagina: int (opcional, max ~50)
 """
 
+import re
 import requests
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 import time
+
+
+def _normalizar(texto: str) -> str:
+    """Minúsculas y sin acentos, para comparar términos sin perder por una tilde."""
+    if not texto:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", texto.lower())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 @dataclass
@@ -45,8 +55,18 @@ class Licitacao:
         """Verifica si la licitación contiene alguno de los términos"""
         if not termos:
             return True
-        texto = f"{self.titulo} {self.objeto}".lower()
-        return any(termo.lower() in texto for termo in termos)
+        # Quita prefijos/tags de metadato del sistema de origen, p. ej.
+        # "[Portal de Compras Públicas] - ...", para no generar falsos positivos.
+        bruto = re.sub(r"\[[^\]]*\]", " ", f"{self.titulo} {self.objeto}")
+        texto = _normalizar(bruto)
+        # Quita el boilerplate "Sistema de Registro de Preços" (es el método de
+        # contratación, no el objeto) para que "sistema" no genere falsos positivos.
+        texto = re.sub(r"sistema de registro de preco[s]?", " ", texto)
+        texto = re.sub(r"registro de preco[s]?", " ", texto)
+        return any(
+            re.search(r"\b" + re.escape(_normalizar(termo)) + r"(s|es)?\b", texto)
+            for termo in termos
+        )
 
 
 class PNCP_API:
@@ -55,23 +75,23 @@ class PNCP_API:
     URL base: https://pncp.gov.br/api/consulta/v1
     """
     
-    BASE_URL = "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao"
-    
-    # Modalidades de contratación
+    BASE_URL = "https://pncp.gov.br/api/consulta/v1/contratacoes/proposta"
+
+    # Modalidades de contratación (códigos oficiales del PNCP)
     MODALIDADES = {
-        1: "Leilão - Loss (Licitação Presencial)",
+        1: "Leilão - Eletrônico",
         2: "Diálogo Competitivo",
         3: "Concurso",
-        4: "Concorrência - Loss (Licitação Presencial)",
-        5: "Concorrência - Eletrônica",
-        6: "Dispensa de Licitação",
-        7: "Inexigibilidade",
-        8: "Pregão - Eletrônico",
-        9: "Pregão - Loss (Licitação Presencial)",
-        10: "Pré-qualificação",
-        11: "Credenciamento",
-        12: "Leilão - Eletrônico",
-        13: "Manifestação de Interesse",
+        4: "Concorrência - Eletrônica",
+        5: "Concorrência - Presencial",
+        6: "Pregão - Eletrônico",
+        7: "Pregão - Presencial",
+        8: "Dispensa de Licitação",
+        9: "Inexigibilidade",
+        10: "Manifestação de Interesse",
+        11: "Pré-qualificação",
+        12: "Credenciamento",
+        13: "Leilão - Presencial",
     }
     
     def __init__(self):
@@ -83,7 +103,6 @@ class PNCP_API:
     
     def buscar(
         self,
-        data_inicial: str,
         data_final: str,
         codigo_modalidade: int,
         uf: Optional[str] = None,
@@ -91,38 +110,54 @@ class PNCP_API:
         tamanho_pagina: int = 50
     ) -> Dict[str, Any]:
         """
-        Busca contrataciones en el PNCP
-        
+        Busca contrataciones con RECEBIMENTO DE PROPOSTAS EM ABERTO en el PNCP.
+        Devuelve solo licitaciones cuya ventana de propuestas sigue abierta
+        (cierre entre hoy y data_final), sin importar cuándo se publicaron.
+
         Args:
-            data_inicial: Fecha inicial YYYYMMDD
-            data_final: Fecha final YYYYMMDD
-            codigo_modalidade: Código de modalidad (1-13)
+            data_final: Fecha límite del cierre de propuestas YYYYMMDD (horizonte)
+            codigo_modalidade: Código de modalidad PNCP (6=Pregão Eletrônico, 8=Dispensa)
             uf: Sigla del estado (opcional)
             pagina: Número de página
-            tamanho_pagina: Registros por página (max 50)
+            tamanho_pagina: Registros por página
         """
-        
-        # Construir URL exactamente como el ejemplo que funciona
-        url = f"{self.BASE_URL}?dataInicial={data_inicial}&dataFinal={data_final}&codigoModalidadeContratacao={codigo_modalidade}&pagina={pagina}&tamanhoPagina={tamanho_pagina}"
-        
+
+        # Endpoint /proposta: filtra por período de propuesta abierto
+        url = f"{self.BASE_URL}?dataFinal={data_final}&codigoModalidadeContratacao={codigo_modalidade}&pagina={pagina}&tamanhoPagina={tamanho_pagina}"
+
         if uf:
             url += f"&uf={uf}"
         
-        try:
-            response = self.session.get(url, timeout=60)
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                print(f"   ⚠️ Error {response.status_code}: {response.text[:200]}")
+        # Reintentos con backoff ante 429 (límite), 5xx (errores transitorios
+        # del servidor) y timeouts.
+        for tentativa in range(1, 6):
+            try:
+                response = self.session.get(url, timeout=60)
+
+                if response.status_code == 200:
+                    return response.json()
+
+                # 429 y 5xx son transitorios: reintentar con backoff
+                if response.status_code == 429 or response.status_code >= 500:
+                    espera = 15 * tentativa  # 15, 30, 45, 60, 75s
+                    print(f"⏳ {response.status_code}, aguardando {espera}s...", end=" ", flush=True)
+                    time.sleep(espera)
+                    continue
+
+                # 4xx (salvo 429): error no recuperable, no insistir
+                print(f"   ⚠️ Error {response.status_code}: {response.text[:120]}")
                 return {"data": [], "error": response.status_code}
-                
-        except requests.exceptions.Timeout:
-            print(f"   ⚠️ Timeout")
-            return {"data": [], "error": "timeout"}
-        except Exception as e:
-            print(f"   ⚠️ Error: {e}")
-            return {"data": [], "error": str(e)}
+
+            except requests.exceptions.Timeout:
+                print("⏳ timeout, reintentando...", end=" ", flush=True)
+                time.sleep(5)
+                continue
+            except Exception as e:
+                print(f"   ⚠️ Error: {e}")
+                return {"data": [], "error": str(e)}
+
+        # Agotados los reintentos
+        return {"data": [], "error": "max_retries"}
     
     def parse_item(self, item: dict) -> Licitacao:
         """Convierte item de la API a objeto Licitacao"""
@@ -164,10 +199,10 @@ class BuscadorLicitacoes:
     def buscar(
         self,
         termos: Optional[List[str]] = None,
+        exclusoes: Optional[List[str]] = None,
         ufs: Optional[List[str]] = None,
         modalidades: Optional[List[int]] = None,
-        dias_atras: int = 7,
-        max_paginas: int = 5
+        dias_adelante: int = 7
     ) -> List[Licitacao]:
         """
         Busca licitaciones
@@ -175,20 +210,23 @@ class BuscadorLicitacoes:
         Args:
             termos: Palabras clave para filtrar (filtro LOCAL)
             ufs: Estados a buscar
-            modalidades: Códigos de modalidad (default: 6=Dispensa, 8=Pregão Eletrônico)
-            dias_atras: Días hacia atrás
-            max_paginas: Máximo de páginas por combinación UF/modalidad
+            modalidades: Códigos de modalidad (default: 6=Pregão Eletrônico, 8=Dispensa)
+            dias_adelante: Horizonte de días hacia ADELANTE (cierre de propuestas)
+
+        Recorre TODAS las páginas que reporta la API (campo totalPaginas),
+        sin tope artificial, para no perder licitaciones.
         """
-        
-        # Calcular fechas
-        data_final = datetime.now().strftime("%Y%m%d")
-        data_inicial = (datetime.now() - timedelta(days=dias_atras)).strftime("%Y%m%d")
-        
-        # Modalidades por defecto: las más comunes
+
+        # Horizonte: propuestas que cierran de hoy a 'dias_adelante' días hacia adelante.
+        # El endpoint /proposta solo devuelve las que siguen ABIERTAS hoy.
+        data_final = (datetime.now() + timedelta(days=dias_adelante)).strftime("%Y%m%d")
+
+        # Modalidades por defecto: las relevantes para servicios de TI
         if not modalidades:
-            modalidades = [2,5,8, 12, 13]  # Dispensa y Pregão Eletrônico Dispensa "6"
-        
-        print(f"\n📅 Período: {data_inicial} - {data_final}")
+            modalidades = [6, 8]  # 6=Pregão Eletrônico, 8=Dispensa de Licitação
+            # Opcionales útiles: 5 (Concorrência Eletrônica), 9 (Inexigibilidade), 12 (Credenciamento)
+
+        print(f"\n📅 Propostas abertas até: {data_final}")
         print(f"📋 Modalidades: {modalidades}")
         print(f"📍 Estados: {ufs or ['Todos']}")
         
@@ -203,38 +241,66 @@ class BuscadorLicitacoes:
                 uf_str = uf or "BR"
                 print(f"\n🔍 {uf_str} - {mod_nome}")
                 
-                # Buscar páginas
-                for pagina in range(1, max_paginas + 1):
-                    print(f"   📄 Página {pagina}...", end=" ")
-                    
+                # Recorrer TODAS las páginas que reporte la API (totalPaginas),
+                # descubierto tras la 1ª página. Sin tope artificial.
+                pagina = 1
+                total_paginas = None
+                while True:
+                    sufixo = f"/{total_paginas}" if total_paginas else ""
+                    print(f"   📄 Página {pagina}{sufixo}...", end=" ")
+
                     resultado = self.api.buscar(
-                        data_inicial=data_inicial,
                         data_final=data_final,
                         codigo_modalidade=mod,
                         uf=uf,
                         pagina=pagina,
                         tamanho_pagina=50
                     )
-                    
+
+                    # En la 1ª página descubrimos el total real que ofrece la API
+                    if total_paginas is None:
+                        total_paginas = resultado.get("totalPaginas") or 0
+                        total_reg = resultado.get("totalRegistros") or 0
+                        print(f"({total_reg} reg / {total_paginas} pág)", end=" ")
+
+                    erro = resultado.get("error")
                     dados = resultado.get("data", [])
-                    
+
+                    # Error tras agotar los reintentos internos: si aún quedan
+                    # páginas por delante, NO abortamos el barrido; omitimos esta
+                    # página y seguimos (un 5xx puntual no nos cuesta el resto).
+                    if erro:
+                        if total_paginas and pagina < total_paginas:
+                            print(f"⏭️  página {pagina} omitida (error {erro})")
+                            pagina += 1
+                            time.sleep(5)
+                            continue
+                        print(f"⚠️  detenido en página {pagina} (error {erro})")
+                        break
+
                     if not dados:
+                        # Página vacía SIN error = no hay más resultados reales
                         print("vazio")
                         break
-                    
+
                     print(f"{len(dados)} registros")
-                    
+
                     for item in dados:
                         lic = self.api.parse_item(item)
                         todas.append(lic)
-                    
-                    # Si recibimos menos de 50, no hay más páginas
-                    if len(dados) < 50:
+
+                    # Parar al llegar a la última página que reporta la API
+                    if total_paginas and pagina >= total_paginas:
                         break
-                    
-                    time.sleep(0.3)  # Rate limiting
-                
-                time.sleep(0.5)  # Pausa entre modalidades
+
+                    # Salvaguarda cuando la API no reporta total: página incompleta = fin
+                    if not total_paginas and len(dados) < 50:
+                        break
+
+                    pagina += 1
+                    time.sleep(5)  # Rate limiting entre páginas
+
+                time.sleep(5)  # Pausa entre modalidades
         
         print(f"\n📊 Total da API: {len(todas)}")
 
@@ -250,6 +316,10 @@ class BuscadorLicitacoes:
         if termos:
             print(f"🔎 Filtrando por: {termos}")
             filtradas = [l for l in abiertas if l.contem_termo(termos)]
+            if exclusoes:
+                antes = len(filtradas)
+                filtradas = [l for l in filtradas if not l.contem_termo(exclusoes)]
+                print(f"   🚫 Excluídas por termos negativos: {antes - len(filtradas)}")
             print(f"   → {len(filtradas)} coinciden")
         else:
             filtradas = abiertas
@@ -281,8 +351,7 @@ if __name__ == "__main__":
     licitacoes = buscador.buscar(
         termos=["software", "tecnologia", "sistema", "informática"],
         ufs=["SP"],
-        dias_atras=7,
-        max_paginas=3
+        dias_adelante=7
     )
     
     print(f"\n{'='*60}")

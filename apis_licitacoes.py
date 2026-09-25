@@ -30,6 +30,17 @@ def _normalizar(texto: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def _fecha_hora(valor: Optional[str]) -> Optional[str]:
+    """'2026-10-05T09:50:00' tal cual (hasta segundos), o None si no trae hora.
+
+    La columna data_encerramento sigue siendo solo la fecha (YYYY-MM-DD)
+    porque todo el código compara textos contra 'hoy'; la hora va aparte.
+    """
+    if not valor or "T" not in valor:
+        return None
+    return valor[:19]
+
+
 @dataclass
 class Licitacao:
     """Estructura de datos para una licitación"""
@@ -48,7 +59,16 @@ class Licitacao:
     fonte: str
     cnpj_orgao: Optional[str] = None
     situacao: Optional[str] = None
-    
+    # Fecha y hora completas del plazo de propuestas ('2026-10-05T09:50:00')
+    data_abertura_ts: Optional[str] = None
+    data_encerramento_ts: Optional[str] = None
+    # De dónde salen las fechas: 'consulta' (API oficial), 'search' (buscador
+    # del portal: NO trae plazo de propuestas, solo vigencia), 'edital', 'manual'
+    fuente_fechas: Optional[str] = None
+    # Vigencia del edital según /api/search. NO es el plazo de propuestas.
+    vigencia_inicio: Optional[str] = None
+    vigencia_fim: Optional[str] = None
+
     def to_dict(self) -> dict:
         return self.__dict__
     
@@ -281,7 +301,7 @@ class PNCP_API:
         a /publicacao, que es precisamente la vía que metió 2.242 filas con
         data_encerramento NULL en agosto de 2026 (mantiene a propósito los
         registros sin fecha de cierre para no perderlos, y salvar_licitacao()
-        es INSERT-only, así que el NULL se queda para siempre). Aquí NO hay
+        era INSERT-only, así que el NULL se quedaba para siempre). Aquí NO hay
         fallback: si /proposta no responde, preferimos no traer nada a traer
         filas mutiladas.
 
@@ -394,7 +414,10 @@ class PNCP_API:
             url=url,
             fonte="PNCP",
             cnpj_orgao=cnpj,
-            situacao=item.get("situacaoCompraNome")
+            situacao=item.get("situacaoCompraNome"),
+            data_abertura_ts=_fecha_hora(item.get("dataAberturaProposta")),
+            data_encerramento_ts=_fecha_hora(item.get("dataEncerramentoProposta")),
+            fuente_fechas="consulta",
         )
 
     # ------------------------------------------------------------------
@@ -482,6 +505,11 @@ class PNCP_API:
         def _fecha(v):
             return v[:10] if v else None
 
+        # data_inicio/fim_vigencia son la VIGENCIA del edital, no el plazo de
+        # propuestas. Hasta el 24/09/2026 se guardaban en data_abertura y
+        # data_encerramento, y el panel y las alertas se alimentaban de ellas
+        # como si fueran el cierre. Ahora van a sus propios campos y las
+        # fechas de propuestas quedan nulas hasta que las dé /consulta.
         return Licitacao(
             id=f"PNCP-{cnpj}-{ano}-{seq}",
             titulo=(item.get("description") or "")[:200],
@@ -492,12 +520,15 @@ class PNCP_API:
             uf=item.get("uf") or "",
             municipio=item.get("municipio_nome"),
             data_publicacao=_fecha(item.get("data_publicacao_pncp")) or "",
-            data_abertura=_fecha(item.get("data_inicio_vigencia")),
-            data_encerramento=_fecha(item.get("data_fim_vigencia")),
+            data_abertura=None,
+            data_encerramento=None,
             url=f"https://pncp.gov.br/app/editais/{cnpj}/{ano}/{seq}",
             fonte="PNCP-search",
             cnpj_orgao=cnpj,
             situacao=item.get("situacao_nome"),
+            fuente_fechas="search",
+            vigencia_inicio=_fecha(item.get("data_inicio_vigencia")),
+            vigencia_fim=_fecha(item.get("data_fim_vigencia")),
         )
 
 
@@ -507,20 +538,23 @@ class BuscadorLicitacoes:
     def __init__(self):
         self.api = PNCP_API()
 
-    def _fecha_por_detalle(self, lic: Licitacao) -> Optional[str]:
+    def _completar_por_detalle(self, lic: Licitacao) -> None:
         """
-        Pide el cierre de propuestas al detalle de la compra. Devuelve
-        'YYYY-MM-DD' (el formato que ya guarda la columna data_encerramento,
-        TEXT) o None si el PNCP tampoco lo tiene.
+        Pide el cierre de propuestas (fecha y hora) al detalle de la compra y
+        lo pone en lic. Si el PNCP tampoco lo tiene, lic queda como estaba.
         """
         try:
             _, cnpj, ano, seq = lic.id.split("-")
         except ValueError:
-            return None  # id con formato raro: no arriesgamos una petición
+            return  # id con formato raro: no arriesgamos una petición
         dados = self.api.consultar_compra(cnpj, ano, seq)
         if not dados:
-            return None
-        return (dados.get("dataEncerramentoProposta") or "")[:10] or None
+            return
+        enc = dados.get("dataEncerramentoProposta")
+        if enc:
+            lic.data_encerramento = enc[:10]
+            lic.data_encerramento_ts = _fecha_hora(enc)
+            lic.fuente_fechas = "consulta"
 
 
     def buscar(
@@ -657,13 +691,13 @@ class BuscadorLicitacoes:
                         # Corte de la hemorragia en origen: el fallback
                         # /publicacao deja pasar a propósito las filas sin
                         # dataEncerramentoProposta (para no perderlas), y
-                        # salvar_licitacao() es INSERT-only -> ese NULL ya no se
-                        # corrige nunca. Así se acumularon 2.414 filas ciegas,
+                        # salvar_licitacao() era INSERT-only -> ese NULL no se
+                        # corregía nunca. Así se acumularon 2.414 filas ciegas,
                         # 2.242 de ellas en agosto de 2026. Preguntamos el
                         # detalle ANTES de guardar; si tampoco lo tiene, se
                         # guarda NULL igual y lo recoge rellenar_fechas.py.
                         if completar_fechas and lic.data_encerramento is None:
-                            lic.data_encerramento = self._fecha_por_detalle(lic)
+                            self._completar_por_detalle(lic)
                         todas.append(lic)
                         # Só entra no lote (gravação incremental) o que passa
                         # o MESMO filtro de termos/exclusões aplicado no fim.
@@ -715,16 +749,20 @@ class BuscadorLicitacoes:
             # épocas. La pasada de las 15:00 del 21/09 grabó 1.443 "novas"
             # (851 ya cerradas, 577 sin fecha, desde 2021) y se puso a bajar
             # pliegos de 2023 mientras las 15 abiertas esperaban en la cola.
-            # salvar_licitacao() es INSERT-only: lo que entra aquí se queda.
+            #
+            # El buscador no trae plazo de propuestas, solo la vigencia del
+            # edital (ver parse_item_search). Aquí se usa la vigencia SOLO
+            # como criterio de corte para no guardar basura antigua, nunca
+            # como fecha de cierre.
             hoy_s = datetime.now().strftime("%Y-%m-%d")
-            # Sin fecha de cierre solo se acepta si se publicó hace poco;
+            # Sin fecha de vigencia solo se acepta si se publicó hace poco;
             # si no, es casi siempre un proceso viejo que nunca la tuvo.
             corte_pub = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             descartadas_search = 0
 
             def _vigente_search(l):
-                if l.data_encerramento:
-                    return l.data_encerramento >= hoy_s
+                if l.vigencia_fim:
+                    return l.vigencia_fim >= hoy_s
                 return (l.data_publicacao or "") >= corte_pub
 
             for termo in termos:

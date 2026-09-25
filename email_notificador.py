@@ -103,6 +103,92 @@ def gerar_html_shortlist(candidatas: list, dias_horizonte: int, max_cards: int =
 
 
 # ============================================================================
+# HTML DEL AVISO DE CAMBIOS (aplazamientos, suspensiones, valor)
+# ============================================================================
+
+_ETIQUETAS_CAMPO = {
+    "data_encerramento": "⏰ Encerramento das propostas",
+    "data_abertura": "📬 Abertura das propostas",
+    "situacao": "🚦 Situação",
+    "valor_estimado": "💰 Valor estimado",
+}
+
+
+def formatar_valor_cambio(campo: str, valor) -> str:
+    """'2026-10-02T08:30:00' → '02/10/2026 08:30'; '2026-09-22' → '22/09/2026'."""
+    if valor is None or valor == "":
+        return "—"
+    if campo.startswith("data_"):
+        s = str(valor)
+        fecha = f"{s[8:10]}/{s[5:7]}/{s[0:4]}"
+        return f"{fecha} {s[11:16]}" if len(s) >= 16 else fecha
+    if campo == "valor_estimado":
+        try:
+            return f"R$ {float(valor):,.2f}"
+        except ValueError:
+            return str(valor)
+    return str(valor)
+
+
+def gerar_html_cambios(cambios: list) -> str:
+    """HTML del aviso de cambios. `cambios` sale de
+    DatabaseLicitacoes.cambios_pendientes_aviso(): una fila por campo
+    cambiado; aquí se agrupan por licitación."""
+
+    por_lic = {}
+    for c in cambios:
+        por_lic.setdefault(c["licitacao_id"], []).append(c)
+
+    cards = ""
+    for lic_id, lista in por_lic.items():
+        c0 = lista[0]
+        filas = ""
+        for c in lista:
+            antes = formatar_valor_cambio(c["campo"], c["valor_anterior"])
+            despues = formatar_valor_cambio(c["campo"], c["valor_nuevo"])
+            color = "#b91c1c" if c["campo"] == "situacao" else "#b45309"
+            filas += f"""
+                <tr><td style="padding: 4px 0; width: 210px;"><strong>{_ETIQUETAS_CAMPO.get(c['campo'], c['campo'])}:</strong></td>
+                    <td><span style="text-decoration: line-through; color: #999;">{antes}</span>
+                        → <span style="color: {color}; font-weight: bold;">{despues}</span></td></tr>"""
+        muro = " · ⚠️ muro econômico" if c0.get("muro_economico") == "SI" else ""
+        cards += f"""
+        <div style="border: 1px solid #fcd34d; border-radius: 8px; padding: 20px; margin: 15px 0; background: #fffbeb;">
+            <h3 style="color: #1a365d; margin: 0 0 6px 0; font-size: 16px; line-height: 1.4;">{(c0.get('objeto') or '')[:200]}</h3>
+            <p style="margin: 0 0 12px 0; color: #666; font-size: 13px;">{c0.get('orgao') or ''} — {c0.get('municipio') or 'N/A'}/{c0.get('uf') or ''}<br>
+               <code>{lic_id}</code> · {c0.get('modalidade') or ''} · plataforma: {c0.get('plataforma') or '?'}{muro}</p>
+            <table style="width: 100%; font-size: 14px; color: #444;">{filas}
+            </table>
+            <p style="margin: 10px 0 0 0; font-size: 12px; color: #999;">Detectado em {c0.get('detectado_em') or ''} · fonte: {c0.get('fuente') or ''}</p>
+            <a href="{c0.get('url') or '#'}" style="display: inline-block; margin-top: 12px; padding: 10px 20px; background: #2563eb; color: white; text-decoration: none; border-radius: 5px; font-size: 14px;">Ver no PNCP</a>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 650px; margin: 0 auto; padding: 20px; background: #f5f5f5;">
+        <div style="background: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h1 style="color: #1a365d; border-bottom: 3px solid #f59e0b; padding-bottom: 15px; margin-top: 0;">
+                📅 Mudanças em licitações acompanhadas
+            </h1>
+            <p style="color: #666; font-size: 15px;">
+                O PNCP mudou <strong style="color: #b45309;">{len(por_lic)}</strong> licitação(ões)
+                desde a última passada. Confirmar a nova data na plataforma antes de cadastrar a proposta.
+            </p>
+            {cards}
+            <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0 20px 0;">
+            <p style="color: #999; font-size: 12px; text-align: center; margin: 0;">
+                Monitor de Licitações Brasil 🇧🇷 — histórico em <code>historico_cambios</code>
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================================
 # OPCIÓN 1: RESEND (RECOMENDADO - MÁS FÁCIL)
 # ============================================================================
 

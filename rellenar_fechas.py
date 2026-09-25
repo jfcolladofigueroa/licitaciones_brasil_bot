@@ -22,6 +22,10 @@ Estrategia, de lo barato a lo caro:
 
 Idempotente: solo lee filas con data_encerramento IS NULL y solo escribe cuando
 el PNCP devuelve una fecha, así que se puede relanzar las veces que haga falta.
+
+Desde el 24/09/2026 escribe a través de DatabaseLicitacoes.salvar_licitacao()
+(el UPSERT), así que cada fecha rellenada queda en historico_cambios con su
+fuente, y se guarda también la hora del cierre.
 Las que el PNCP tampoco sabe (contrataciones directas sin plazo publicado) se
 quedarán NULL para siempre y se reportan aparte: son ruido esperado, no un fallo.
 
@@ -41,6 +45,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from apis_licitacoes import PNCP_API
+from database import DatabaseLicitacoes
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / "licitacoes.db"
@@ -61,19 +66,11 @@ def _pendientes(con, limite=None):
     return [f[0] for f in con.execute(sql).fetchall()]
 
 
-def _grabar(con, id_lic, fecha, aplicar):
-    """
-    COALESCE defensivo: si otra ejecución en paralelo ya puso fecha, no la
-    pisamos. Sin él, dos pasadas simultáneas podrían escribir valores distintos.
-    """
+def _grabar(db, lic, aplicar):
+    """Pasa por el UPSERT: queda en el histórico y nunca pisa con nulos."""
     if not aplicar:
         return
-    con.execute(
-        "UPDATE licitacoes SET data_encerramento = COALESCE(data_encerramento, ?) "
-        "WHERE id = ?",
-        (fecha, id_lic),
-    )
-    con.commit()
+    db.salvar_licitacao(lic)
 
 
 def rellenar(db=DB, aplicar=True, limite=None, con_barrido=True) -> dict:
@@ -86,6 +83,8 @@ def rellenar(db=DB, aplicar=True, limite=None, con_barrido=True) -> dict:
         return {"pendientes": 0, "por_barrido": 0, "por_detalle": 0, "sin_fecha": 0}
 
     api = PNCP_API()
+    # En --dry-run no se instancia: abrirla aplicaría migraciones pendientes
+    base = DatabaseLicitacoes(str(db)) if aplicar else None
     por_barrido = por_detalle = 0
     faltan = set(pendientes)
 
@@ -101,7 +100,7 @@ def rellenar(db=DB, aplicar=True, limite=None, con_barrido=True) -> dict:
             print(f"   {len(abiertas)} contrataciones abiertas leídas", flush=True)
             for lic in abiertas:
                 if lic.id in faltan and lic.data_encerramento:
-                    _grabar(con, lic.id, lic.data_encerramento, aplicar)
+                    _grabar(base, lic, aplicar)
                     faltan.discard(lic.id)
                     por_barrido += 1
         print(f"✅ Rellenadas por barrido: {por_barrido}", flush=True)
@@ -119,7 +118,7 @@ def rellenar(db=DB, aplicar=True, limite=None, con_barrido=True) -> dict:
         dados = api.consultar_compra(cnpj, ano, seq)
         fecha = ((dados or {}).get("dataEncerramentoProposta") or "")[:10] or None
         if fecha:
-            _grabar(con, id_lic, fecha, aplicar)
+            _grabar(base, api.parse_item(dados), aplicar)
             por_detalle += 1
         else:
             sin_fecha += 1

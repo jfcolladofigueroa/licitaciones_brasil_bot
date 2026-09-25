@@ -17,9 +17,10 @@ from datetime import datetime
 from typing import List, Optional
 
 from apis_licitacoes import BuscadorLicitacoes, Licitacao
-from database import DatabaseLicitacoes
+from database import DatabaseLicitacoes, NUEVA, ACTUALIZADA
 from descargador_documentos import DescargadorDocumentos
-from email_notificador import criar_notificador, gerar_html_shortlist
+from email_notificador import (criar_notificador, gerar_html_shortlist,
+                               gerar_html_cambios, formatar_valor_cambio)
 from triaje import TriadorLicitacoes
 
 
@@ -125,18 +126,25 @@ class MonitorLicitacoes:
         # hora. Se a busca falhar a meio (API instável, 500/503), NÃO se perde
         # o que já foi descarregado.
         novas_incremental = []
+        actualizadas = []
 
         def _guardar_pagina(lote):
-            gravadas = 0
+            gravadas = cambiadas = 0
             for lic in lote:
                 try:
-                    if self.db.salvar_licitacao(lic):
+                    r = self.db.salvar_licitacao(lic)
+                    if r == NUEVA:
                         novas_incremental.append(lic)
                         gravadas += 1
+                    elif r == ACTUALIZADA:
+                        actualizadas.append(lic.id)
+                        cambiadas += 1
                 except Exception as e:
                     print(f"   ⚠️ erro ao gravar {lic.id}: {e}", end=" ")
             if gravadas:
                 print(f"[+{gravadas} gravadas]", end=" ", flush=True)
+            if cambiadas:
+                print(f"[~{cambiadas} actualizadas]", end=" ", flush=True)
 
         # Buscar
         try:
@@ -200,6 +208,7 @@ class MonitorLicitacoes:
         novas = novas_incremental
         
         print(f"🆕 Novas (não vistas antes): {len(novas)}")
+        print(f"🔄 Já conhecidas com dados actualizados: {len(actualizadas)}")
         
         # Mostrar resumen
         if novas:
@@ -237,7 +246,60 @@ class MonitorLicitacoes:
         # Triaje por reglas de lo descargado pendiente + shortlist
         self.triar(enviar_email=enviar_email)
 
+        # Aplazamientos, suspensiones y cambios de valor detectados
+        self.avisar_cambios(enviar_email=enviar_email)
+
         return novas
+
+    def refrescar(self, ids: List[str], enviar_email: bool = True):
+        """
+        Relee del PNCP (detalle de la compra) las licitaciones indicadas y
+        aplica el UPSERT. Sirve para las que ya no salen en /proposta —
+        una sesión aplazada fuera del horizonte, una suspendida— y para
+        comprobar a mano una concreta. Termina con el aviso de cambios.
+        """
+        api = self.buscador.api
+        print(f"\n🔄 Refrescando {len(ids)} licitação(ões) desde o PNCP...")
+        for lic_id in ids:
+            try:
+                _, cnpj, ano, seq = lic_id.split("-")
+            except ValueError:
+                print(f"   ⚠️ {lic_id}: id fuera del formato PNCP-cnpj-ano-seq")
+                continue
+            dados = api.consultar_compra(cnpj, ano, seq)
+            if not dados:
+                print(f"   ⚠️ {lic_id}: el PNCP no devolvió el detalle")
+                continue
+            r = self.db.salvar_licitacao(api.parse_item(dados))
+            print(f"   {lic_id}: {r}")
+        self.avisar_cambios(enviar_email=enviar_email)
+
+    def avisar_cambios(self, enviar_email: bool = True) -> int:
+        """
+        Avisa de los cambios (fecha, situación, valor) aún no avisados.
+        Solo los marca como avisados si el email salió: sin email, se
+        vuelven a mostrar en la próxima pasada.
+        """
+        cambios = self.db.cambios_pendientes_aviso()
+        if not cambios:
+            print("📭 Sin cambios de fecha/situación pendientes de aviso.")
+            return 0
+
+        n_lic = len({c["licitacao_id"] for c in cambios})
+        print(f"\n📅 {n_lic} licitação(ões) com mudanças:")
+        for c in cambios:
+            print(f"   • {c['licitacao_id']} {c['campo']}: "
+                  f"{formatar_valor_cambio(c['campo'], c['valor_anterior'])} → "
+                  f"{formatar_valor_cambio(c['campo'], c['valor_nuevo'])}")
+
+        if not (enviar_email and self.email):
+            print("   (sin email: quedan pendientes para la próxima pasada)")
+            return n_lic
+
+        assunto = f"📅 {n_lic} licitação(ões) mudaram de data ou situação"
+        if self.email.enviar_html(assunto, gerar_html_cambios(cambios)):
+            self.db.marcar_cambios_avisados([c["cambio_id"] for c in cambios])
+        return n_lic
 
     def triar(self, enviar_email: bool = True):
         """
@@ -378,6 +440,8 @@ Ejemplos:
   python monitor.py --descargar            # Descargar docs pendientes
   python monitor.py --descargar --limite 5 # Solo las 5 más recientes
   python monitor.py --triar                # Triar pendientes + regenerar CSV
+  python monitor.py --refrescar PNCP-…     # Releer del PNCP y avisar de cambios
+  python monitor.py --avisar-cambios       # Enviar solo el aviso de cambios
         """
     )
 
@@ -391,6 +455,10 @@ Ejemplos:
     parser.add_argument("--descargar", action="store_true", help="Descargar documentos pendientes")
     parser.add_argument("--triar", action="store_true", help="Triar pendientes y regenerar candidatas.csv")
     parser.add_argument("--limite", type=int, help="Límite de licitaciones para --descargar")
+    parser.add_argument("--refrescar", nargs="+", metavar="ID",
+                        help="Releer estas licitaciones del PNCP y avisar de cambios")
+    parser.add_argument("--avisar-cambios", action="store_true",
+                        help="Enviar el aviso de cambios pendientes")
     parser.add_argument("--config", "-c", default="config.json", help="Archivo de config")
 
     args = parser.parse_args()
@@ -413,6 +481,12 @@ Ejemplos:
 
     elif args.triar:
         monitor.triar(enviar_email=not args.sem_email)
+
+    elif args.refrescar:
+        monitor.refrescar(args.refrescar, enviar_email=not args.sem_email)
+
+    elif args.avisar_cambios:
+        monitor.avisar_cambios(enviar_email=not args.sem_email)
 
     else:
         # Buscar licitaciones

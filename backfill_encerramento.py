@@ -8,6 +8,10 @@ detalle de cada compra en el PNCP:
 
 Se puede relanzar sin problema: solo procesa las filas con campos vacíos.
 
+Desde el 24/09/2026 las fechas pasan por DatabaseLicitacoes.salvar_licitacao()
+(el UPSERT con histórico). Antes hacía COALESCE(?, data_encerramento), que
+sobrescribía la fecha sin dejar rastro.
+
 Uso: python backfill_encerramento.py
 """
 
@@ -16,11 +20,16 @@ import time
 
 import requests
 
+from apis_licitacoes import PNCP_API
+from database import DatabaseLicitacoes
+
 DB = "licitacoes.db"
 URL = "https://pncp.gov.br/api/consulta/v1/orgaos/{cnpj}/compras/{ano}/{seq}"
 
 
 def main():
+    base = DatabaseLicitacoes(DB)
+    api = PNCP_API()
     conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -52,19 +61,17 @@ def main():
                 resp = session.get(URL.format(cnpj=cnpj, ano=ano, seq=seq), timeout=30)
             if resp.status_code == 200:
                 dados = resp.json()
-                enc = (dados.get("dataEncerramentoProposta") or "")[:10] or None
-                ab = (dados.get("dataAberturaProposta") or "")[:10] or None
+                # Fechas, situación y valor: por el UPSERT (con histórico)
+                base.salvar_licitacao(api.parse_item(dados))
                 unidade = dados.get("unidadeOrgao") or {}
                 uf = unidade.get("ufSigla")
                 municipio = unidade.get("municipioNome")
                 cur.execute(
                     """UPDATE licitacoes
-                       SET data_encerramento = COALESCE(?, data_encerramento),
-                           data_abertura = COALESCE(data_abertura, ?),
-                           uf = COALESCE(NULLIF(uf, ''), ?),
+                       SET uf = COALESCE(NULLIF(uf, ''), ?),
                            municipio = COALESCE(municipio, ?)
                        WHERE id = ?""",
-                    (enc, ab, uf, municipio, row["id"]),
+                    (uf, municipio, row["id"]),
                 )
                 conn.commit()
                 ok += 1

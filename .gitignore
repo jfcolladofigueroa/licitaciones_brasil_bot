@@ -8,10 +8,24 @@ licitaciones_env/
 *.db
 licitacoes.db
 
+# Documentos descargados de las licitaciones
+descargas/
+
 # Logs
 *.log
+*.log.*
 monitor.log
+
+# Salida del triaje y datos de OCR
+candidatas.csv
+tessdata/
 
 # Python
 __pycache__/
 *.py[cod]
+
+# Copias de seguridad manuales (*.bak_AAAAMMDD) y temporales
+*.bak_*
+*.tmp
+.DS_Store
+logs/

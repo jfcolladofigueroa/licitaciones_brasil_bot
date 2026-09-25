@@ -96,6 +96,46 @@ class DatabaseLicitacoes:
                 )
             """)
             
+            # Migración: columna para marcar documentos ya descargados
+            cursor.execute("PRAGMA table_info(licitacoes)")
+            colunas = [row["name"] for row in cursor.fetchall()]
+            if "docs_baixados" not in colunas:
+                cursor.execute(
+                    "ALTER TABLE licitacoes ADD COLUMN docs_baixados INTEGER DEFAULT 0"
+                )
+
+            # Migración: fecha de cierre de propuestas (clave para "próximas a vencer")
+            if "data_encerramento" not in colunas:
+                cursor.execute(
+                    "ALTER TABLE licitacoes ADD COLUMN data_encerramento TEXT"
+                )
+
+            # Tabla de triaje por reglas (buckets + flags de muros)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS triaje (
+                    licitacao_id TEXT PRIMARY KEY,
+                    bucket TEXT,               -- CANDIDATA / NO_SOFTWARE
+                    muro_economico TEXT,       -- SI / NO / ?  (único que descarta)
+                    poc TEXT,                  -- SI / NO (etiqueta, nunca descarta)
+                    fabrica_pf TEXT,           -- SI / NO
+                    spec_pesada TEXT,          -- SI / NO
+                    plataforma TEXT,
+                    me_epp TEXT,               -- exclusiva / ampla / ?
+                    valor_extraido REAL,       -- fallback por regex si la API no trae valor
+                    texto_ok INTEGER,          -- 1 si se pudo extraer texto de la carpeta
+                    fecha_triaje TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (licitacao_id) REFERENCES licitacoes(id)
+                )
+            """)
+
+            # Migración: etiquetas nuevas del triaje (regla de oro: solo el
+            # muro económico descarta; el resto se etiqueta para revisión)
+            cursor.execute("PRAGMA table_info(triaje)")
+            cols_triaje = [row["name"] for row in cursor.fetchall()]
+            for col in ("software_publico", "atestado_exigido", "poc_roteiro"):
+                if col not in cols_triaje:
+                    cursor.execute(f"ALTER TABLE triaje ADD COLUMN {col} TEXT")
+
             # Índices para búsquedas rápidas
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_uf ON licitacoes(uf)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_data ON licitacoes(data_publicacao)")
@@ -123,9 +163,9 @@ class DatabaseLicitacoes:
             cursor.execute("""
                 INSERT INTO licitacoes (
                     id, titulo, objeto, orgao, valor_estimado, modalidade,
-                    uf, municipio, data_publicacao, data_abertura, url,
-                    fonte, cnpj_orgao, situacao
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    uf, municipio, data_publicacao, data_abertura,
+                    data_encerramento, url, fonte, cnpj_orgao, situacao
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 licitacao.id,
                 licitacao.titulo,
@@ -137,6 +177,7 @@ class DatabaseLicitacoes:
                 licitacao.municipio,
                 licitacao.data_publicacao,
                 licitacao.data_abertura,
+                licitacao.data_encerramento,
                 licitacao.url,
                 licitacao.fonte,
                 licitacao.cnpj_orgao,
@@ -237,6 +278,123 @@ class DatabaseLicitacoes:
                 VALUES (?, ?, ?, ?)
             """, (licitacao_id, canal, 1 if sucesso else 0, erro))
     
+    def marcar_docs_baixados(self, licitacao_id: str):
+        """Marca que los documentos de una licitación ya fueron descargados"""
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE licitacoes SET docs_baixados = 1 WHERE id = ?",
+                (licitacao_id,)
+            )
+
+    def obtener_pendientes_descarga(self, limite: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Licitaciones con link cuyos documentos aún no se descargaron.
+
+        Excluye las ya clasificadas NO_SOFTWARE: nunca se re-descargan,
+        aunque sus carpetas desaparezcan de descargas/.
+        """
+
+        query = """
+            SELECT l.id, l.titulo, l.url FROM licitacoes l
+            LEFT JOIN triaje t ON t.licitacao_id = l.id
+            WHERE l.url IS NOT NULL AND l.docs_baixados = 0
+              AND (t.bucket IS NULL OR t.bucket != 'NO_SOFTWARE')
+            ORDER BY
+                CASE WHEN l.data_encerramento IS NULL THEN 1 ELSE 0 END,
+                l.data_encerramento ASC,
+                l.data_encontrada DESC
+        """
+        params = []
+        if limite:
+            query += " LIMIT ?"
+            params.append(limite)
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # TRIAJE POR REGLAS
+    # =========================================================================
+
+    def guardar_triaje(self, licitacao_id: str, resultado: Dict[str, Any]):
+        """Guarda (o actualiza) el resultado del triaje de una licitación."""
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO triaje (
+                    licitacao_id, bucket, muro_economico, poc, fabrica_pf,
+                    spec_pesada, software_publico, atestado_exigido, poc_roteiro,
+                    plataforma, me_epp, valor_extraido, texto_ok
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                licitacao_id,
+                resultado.get("bucket"),
+                resultado.get("muro_economico"),
+                resultado.get("poc"),
+                resultado.get("fabrica_pf"),
+                resultado.get("spec_pesada"),
+                resultado.get("software_publico"),
+                resultado.get("atestado_exigido"),
+                resultado.get("poc_roteiro"),
+                resultado.get("plataforma"),
+                resultado.get("me_epp"),
+                resultado.get("valor_extraido"),
+                1 if resultado.get("texto_ok") else 0,
+            ))
+
+    def obtener_por_id(self, licitacao_id: str) -> Optional[Dict[str, Any]]:
+        """Una licitación por su id, o None."""
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM licitacoes WHERE id = ?", (licitacao_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def ids_no_software(self) -> List[str]:
+        """Ids ya clasificados NO_SOFTWARE (registro anti re-descarga)."""
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT licitacao_id FROM triaje WHERE bucket = 'NO_SOFTWARE'")
+            return [row["licitacao_id"] for row in cursor.fetchall()]
+
+    def pendientes_triaje(self) -> List[str]:
+        """Ids con documentos descargados que aún no pasaron por el triaje."""
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT l.id FROM licitacoes l
+                LEFT JOIN triaje t ON t.licitacao_id = l.id
+                WHERE l.docs_baixados = 1 AND t.licitacao_id IS NULL
+                ORDER BY l.data_encontrada DESC
+            """)
+            return [row["id"] for row in cursor.fetchall()]
+
+    def obtener_candidatas(self) -> List[Dict[str, Any]]:
+        """Candidatas con sus flags de triaje (para el CSV y las alertas)."""
+
+        with self._conexao() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT l.id, l.objeto, l.orgao, l.cnpj_orgao, l.uf, l.municipio,
+                       l.valor_estimado, l.modalidade, l.data_abertura,
+                       l.data_encerramento, l.url, l.notificado,
+                       t.bucket, t.muro_economico, t.poc, t.fabrica_pf,
+                       t.spec_pesada, t.software_publico, t.atestado_exigido,
+                       t.poc_roteiro, t.plataforma, t.me_epp,
+                       t.valor_extraido, t.texto_ok
+                FROM triaje t
+                JOIN licitacoes l ON l.id = t.licitacao_id
+                WHERE t.bucket = 'CANDIDATA'
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
     def marcar_favorita(self, licitacao_id: str, favorito: bool = True):
         """Marca/desmarca una licitación como favorita"""
         

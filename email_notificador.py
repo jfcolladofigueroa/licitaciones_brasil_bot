@@ -35,6 +35,74 @@ except ImportError:
 
 
 # ============================================================================
+# HTML DEL SHORTLIST DE CANDIDATAS (triaje por reglas)
+# ============================================================================
+
+def gerar_html_shortlist(candidatas: list, dias_horizonte: int, max_cards: int = 30) -> str:
+    """HTML para el email de candidatas SIN muros próximas a vencer.
+
+    Muestra como máximo max_cards (las más urgentes); el resto queda
+    referenciado en candidatas.csv para no generar un email inmanejable.
+    """
+
+    restantes = max(0, len(candidatas) - max_cards)
+    cards = ""
+    for c in candidatas[:max_cards]:
+        valor = f"R$ {c['valor']:,.2f}" if c.get("valor") else "Não informado"
+        piso = f"R$ {c['piso_50']:,.2f}" if c.get("piso_50") else "-"
+        flags = []
+        if c.get("software_publico") == "SI":
+            flags.append("🟢 software público")
+        if c.get("poc") == "SI":
+            flags.append("PoC/amostra")
+        if c.get("fabrica_pf") == "SI":
+            flags.append("fábrica PF")
+        if c.get("spec_pesada") == "SI":
+            flags.append("spec pesada")
+        flags_txt = " | ".join(flags) if flags else "sem alertas"
+        cards += f"""
+        <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; margin: 15px 0; background: #fafafa;">
+            <h3 style="color: #1a365d; margin: 0 0 15px 0; font-size: 16px; line-height: 1.4;">{(c.get('objeto') or '')[:200]}</h3>
+            <table style="width: 100%; font-size: 14px; color: #444;">
+                <tr><td style="padding: 4px 0; width: 140px;"><strong>🏢 Órgão:</strong></td><td>{c.get('orgao') or ''}</td></tr>
+                <tr><td style="padding: 4px 0;"><strong>📍 Local:</strong></td><td>{c.get('municipio') or 'N/A'} - {c.get('uf') or ''}</td></tr>
+                <tr><td style="padding: 4px 0;"><strong>⏰ Encerramento:</strong></td><td style="color: #b45309; font-weight: bold;">{c.get('data_encerramento') or '?'}</td></tr>
+                <tr><td style="padding: 4px 0;"><strong>💰 Valor:</strong></td><td style="color: #2d7a2d; font-weight: bold;">{valor} <span style="color:#999; font-weight:normal;">(piso 50%: {piso})</span></td></tr>
+                <tr><td style="padding: 4px 0;"><strong>🖥 Plataforma:</strong></td><td>{c.get('plataforma') or '?'}</td></tr>
+                <tr><td style="padding: 4px 0;"><strong>🏷 ME/EPP:</strong></td><td>{c.get('me_epp') or '?'}</td></tr>
+                <tr><td style="padding: 4px 0;"><strong>🚩 Flags:</strong></td><td>{flags_txt}</td></tr>
+            </table>
+            <a href="{c.get('url') or '#'}" style="display: inline-block; margin-top: 12px; padding: 10px 20px; background: #2563eb; color: white; text-decoration: none; border-radius: 5px; font-size: 14px;">Ver no PNCP</a>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 650px; margin: 0 auto; padding: 20px; background: #f5f5f5;">
+        <div style="background: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h1 style="color: #1a365d; border-bottom: 3px solid #16a34a; padding-bottom: 15px; margin-top: 0;">
+                🎯 Candidatas sem muros
+            </h1>
+            <p style="color: #666; font-size: 15px;">
+                <strong style="color: #16a34a;">{len(candidatas)}</strong> candidata(s) SEM muro econômico
+                com encerramento nos próximos <strong>{dias_horizonte}</strong> dias.
+                Shortlist completo em <code>candidatas.csv</code>.
+            </p>
+            {cards}
+            {f'<p style="color: #666; font-size: 14px;">… e mais <strong>{restantes}</strong> candidata(s) no <code>candidatas.csv</code>.</p>' if restantes else ''}
+            <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0 20px 0;">
+            <p style="color: #999; font-size: 12px; text-align: center; margin: 0;">
+                Monitor de Licitações Brasil 🇧🇷 — triagem por regras
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================================
 # OPCIÓN 1: RESEND (RECOMENDADO - MÁS FÁCIL)
 # ============================================================================
 
@@ -93,8 +161,11 @@ class EmailResend:
         if not assunto:
             assunto = f"🔔 {len(licitacoes)} Nova(s) Licitação(ões) Encontrada(s)"
         
-        html = self._gerar_html(licitacoes)
-        
+        return self.enviar_html(assunto, self._gerar_html(licitacoes))
+
+    def enviar_html(self, assunto: str, html: str) -> bool:
+        """Envía un email con HTML arbitrario (p.ej. el shortlist del triaje)"""
+
         try:
             response = requests.post(
                 self.api_url,
@@ -110,14 +181,14 @@ class EmailResend:
                 },
                 timeout=30
             )
-            
+
             if response.status_code == 200:
                 print(f"✅ Email enviado para {self.email_to}")
                 return True
             else:
                 print(f"❌ Error {response.status_code}: {response.text}")
                 return False
-                
+
         except Exception as e:
             print(f"❌ Error al enviar: {e}")
             return False
@@ -220,8 +291,11 @@ class EmailSendGrid:
             assunto = f"🔔 {len(licitacoes)} Nova(s) Licitação(ões)"
         
         # Reutilizamos el generador de HTML de Resend
-        html = EmailResend._gerar_html(self, licitacoes)
-        
+        return self.enviar_html(assunto, EmailResend._gerar_html(self, licitacoes))
+
+    def enviar_html(self, assunto: str, html: str) -> bool:
+        """Envía un email con HTML arbitrario (p.ej. el shortlist del triaje)"""
+
         try:
             response = requests.post(
                 self.api_url,
@@ -237,14 +311,14 @@ class EmailSendGrid:
                 },
                 timeout=30
             )
-            
+
             if response.status_code in [200, 202]:
                 print(f"✅ Email enviado para {self.email_to}")
                 return True
             else:
                 print(f"❌ Error {response.status_code}: {response.text}")
                 return False
-                
+
         except Exception as e:
             print(f"❌ Error: {e}")
             return False
@@ -306,14 +380,20 @@ class EmailSMTP:
         if not assunto:
             assunto = f"🔔 {len(licitacoes)} Nova(s) Licitação(ões)"
         
-        html = EmailResend._gerar_html(self, licitacoes)
-        
+        return self.enviar_html(assunto, EmailResend._gerar_html(self, licitacoes))
+
+    def enviar_html(self, assunto: str, html: str) -> bool:
+        """Envía un email con HTML arbitrario (p.ej. el shortlist del triaje)"""
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = assunto
         msg["From"] = self.email_from
         msg["To"] = self.email_to
         msg.attach(MIMEText(html, "html", "utf-8"))
-        
+
         try:
             with smtplib.SMTP(self.smtp_servidor, self.smtp_porta) as server:
                 server.starttls()
